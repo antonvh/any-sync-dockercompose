@@ -250,3 +250,40 @@ services:
       test: any-sync-netcheck -c /conf/nodes.yml 2>&1| grep -E 'netcheck\s+success'
       interval: 10s
       start_period: 5s
+
+  anytype-cli:
+    image: "anyproto/anytype-cli:latest"
+    depends_on:
+      generateconfig-processing:
+        condition: service_completed_successfully
+      any-sync-coordinator:
+        condition: service_healthy
+    environment:
+      ANYTYPE_LOG_LEVEL: "${ANYTYPE_LOG_LEVEL}"
+      ANYTYPE_BOT_NAME: "${ANYTYPE_BOT_NAME}"
+      ANYTYPE_API_KEY_NAME: "${ANYTYPE_API_KEY_NAME}"
+    volumes:
+      - anytype-cli-config:/root/.anytype:Z
+      - anytype-cli-home:/root/.config/anytype:Z
+      - "${STORAGE_DIR}/docker-generateconfig:/data/network-config:ro,Z"
+    ports:
+      - "127.0.0.1:${ANYTYPE_API_PORT}:${ANYTYPE_API_PORT}"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-H", "Authorization: Bearer check", "http://localhost:${ANYTYPE_API_PORT}/api/v1/account.info"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: always
+    entrypoint: []
+    command: >
+      /bin/sh -c "
+      if [ -f /data/network-config/anytype-cli-init.sh ]; then
+        bash /data/network-config/anytype-cli-init.sh /data/network-config/nodesProcessed.yml || true;
+      fi;
+      exec anytype serve --listen-address 0.0.0.0:${ANYTYPE_API_PORT}
+      "
+
+volumes:
+  anytype-cli-config:
+  anytype-cli-home:

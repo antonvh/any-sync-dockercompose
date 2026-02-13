@@ -64,4 +64,10 @@ for FILE in $( find ${DEST_PATH}/ -name "*.yml" ); do
     yq --inplace --indent=2 $FILE
 done
 
+echo "INFO: Generate anytype-cli network config"
+if [ -f "storage/docker-generateconfig/nodesProcessed.yml" ]; then
+    cp "storage/docker-generateconfig/nodesProcessed.yml" "storage/docker-generateconfig/anytype-cli-network.yml"
+    echo "INFO: Anytype-CLI network config generated"
+fi
+
 echo "INFO: $0 done"
