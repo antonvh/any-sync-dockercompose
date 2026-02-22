@@ -1,0 +1,358 @@
+services:
+  # generate configs using the anyconf utility
+  generateconfig-anyconf:
+    restart: "no"
+    build:
+      context: .
+      dockerfile: Dockerfile-generateconfig-anyconf
+    environment:
+      - ANY_SYNC_NODE_1_ADDRESSES=${ANY_SYNC_NODE_1_ADDRESSES}
+      - ANY_SYNC_NODE_2_ADDRESSES=${ANY_SYNC_NODE_2_ADDRESSES}
+      - ANY_SYNC_NODE_3_ADDRESSES=${ANY_SYNC_NODE_3_ADDRESSES}
+      - ANY_SYNC_COORDINATOR_ADDRESSES=${ANY_SYNC_COORDINATOR_ADDRESSES}
+      - ANY_SYNC_FILENODE_ADDRESSES=${ANY_SYNC_FILENODE_ADDRESSES}
+      - ANY_SYNC_CONSENSUSNODE_ADDRESSES=${ANY_SYNC_CONSENSUSNODE_ADDRESSES}
+    volumes:
+      - "${CONFIG_DIR}:/code:Z"
+      - "${STORAGE_DIR}:/code/storage:Z"
+    networks:
+      - anytype
+
+  # processing any-sync-* configs
+  generateconfig-processing:
+    restart: "no"
+    depends_on:
+      generateconfig-anyconf:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile-generateconfig-processing
+    environment:
+      - EXTERNAL_LISTEN_HOST=${EXTERNAL_LISTEN_HOST}
+      - EXTERNAL_LISTEN_HOSTS=${EXTERNAL_LISTEN_HOSTS:-}
+    volumes:
+      - "${CONFIG_DIR}:/code:Z"
+      - "${STORAGE_DIR}:/code/storage:Z"
+    networks:
+      - anytype
+
+  mongo-1:
+    depends_on:
+      generateconfig-processing:
+        condition: service_completed_successfully
+    image: "mongo:${MONGO_VERSION}"
+    restart: unless-stopped
+    command: ["--replSet", "${MONGO_REPLICA_SET}", "--port", "${MONGO_1_PORT}"]
+    volumes:
+      - "${STORAGE_DIR}/mongo-1:/data/db:Z"
+    healthcheck:
+      test: test $$(mongosh --port ${MONGO_1_PORT} --quiet --eval "try {rs.initiate({_id:'${MONGO_REPLICA_SET}',members:[{_id:0,host:\"mongo-1:${MONGO_1_PORT}\"}]})} catch(e) {rs.status().ok}") -eq 1
+      interval: 10s
+      start_period: 30s
+    networks:
+      - anytype
+
+  redis:
+    depends_on:
+      generateconfig-processing:
+        condition: service_completed_successfully
+    image: "redis/redis-stack-server:${REDIS_VERSION}"
+    restart: unless-stopped
+    command: ["redis-server", "--port", "${REDIS_PORT}", "--dir", "/data/", "--appendonly", "yes", "--maxmemory", "${REDIS_MAXMEMORY}", "--maxmemory-policy", "noeviction", "--protected-mode", "no", "--loadmodule", "/opt/redis-stack/lib/redisbloom.so"]
+    volumes:
+      - "${STORAGE_DIR}/redis:/data:Z"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "--raw", "-p", "${REDIS_PORT}", "incr", "ping" ]
+      interval: 10s
+      timeout: 30s
+      retries: 3
+    networks:
+      - anytype
+
+  minio:
+    image: "minio/minio:${MINIO_VERSION}"
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":${MINIO_WEB_PORT}", "--address", ":${MINIO_PORT}"]
+    environment:
+      MINIO_ROOT_USER: "${AWS_ACCESS_KEY_ID}"
+      MINIO_ROOT_PASSWORD: "${AWS_SECRET_ACCESS_KEY}"
+    volumes:
+      - "${STORAGE_DIR}/minio:/data:Z"
+    healthcheck:
+      test: bash -c ':> /dev/tcp/127.0.0.1/${MINIO_PORT}' || exit 1
+      interval: 5s
+      timeout: 10s
+      retries: 3
+    networks:
+      anytype:
+        aliases:
+          - "${MINIO_BUCKET}.minio" # <bucket-name>.<endpoint-name>
+
+  create-bucket:
+    restart: "no"
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set minio http://minio:${MINIO_PORT} '${AWS_ACCESS_KEY_ID}' '${AWS_SECRET_ACCESS_KEY}') do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc mb minio/${MINIO_BUCKET};
+      exit 0;
+      "
+    networks:
+      - anytype
+
+  any-sync-coordinator_bootstrap:
+    image: "ghcr.io/anyproto/any-sync-coordinator:${ANY_SYNC_COORDINATOR_VERSION}"
+    depends_on:
+      generateconfig-processing:
+        condition: service_completed_successfully
+      mongo-1:
+        condition: service_healthy
+    volumes:
+      - "${CONFIG_DIR}/etc/any-sync-coordinator:/etc/any-sync-coordinator:Z"
+    restart: "no"
+    command: ["/bin/any-sync-confapply", "-c", "/etc/any-sync-coordinator/config.yml", "-n", "/etc/any-sync-coordinator/network.yml", "-e"]
+    networks:
+      - anytype
+
+  any-sync-coordinator:
+    image: "ghcr.io/anyproto/any-sync-coordinator:${ANY_SYNC_COORDINATOR_VERSION}"
+    depends_on:
+      generateconfig-processing:
+        condition: service_completed_successfully
+      mongo-1:
+        condition: service_healthy
+      any-sync-coordinator_bootstrap:
+        condition: service_completed_successfully
+    labels:
+      - "traefik.enable=true"
+      - "traefik.tcp.routers.anytype-coordinator.rule=HostSNI(`${ANY_SYNC_DOMAIN}`)"
+      - "traefik.tcp.routers.anytype-coordinator.entrypoints=anytype-tcp-1004"
+      - "traefik.tcp.routers.anytype-coordinator.tls=true"
+      - "traefik.tcp.routers.anytype-coordinator.tls.certresolver=letsencrypt"
+      - "traefik.tcp.services.anytype-coordinator.loadbalancer.server.port=${ANY_SYNC_COORDINATOR_PORT}"
+      - "traefik.udp.routers.anytype-coordinator.entrypoints=anytype-udp-1014"
+      - "traefik.udp.services.anytype-coordinator.loadbalancer.server.port=${ANY_SYNC_COORDINATOR_QUIC_PORT}"
+    volumes:
+      - "${CONFIG_DIR}/etc/any-sync-coordinator:/etc/any-sync-coordinator:Z"
+      - "${STORAGE_DIR}/networkStore/any-sync-coordinator:/networkStore:Z"
+    deploy:
+      resources:
+        limits:
+          memory: ${ANY_SYNC_DAEMONS_MEMORY_LIMIT:-}
+    restart: unless-stopped
+    networks:
+      - anytype
+      - proxy
+
+  any-sync-filenode:
+    image: "ghcr.io/anyproto/any-sync-filenode:${ANY_SYNC_FILENODE_VERSION}"
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      any-sync-coordinator:
+        condition: service_started
+    labels:
+      - "traefik.enable=true"
+      - "traefik.tcp.routers.anytype-filenode.rule=HostSNI(`${ANY_SYNC_DOMAIN}`)"
+      - "traefik.tcp.routers.anytype-filenode.entrypoints=anytype-tcp-1005"
+      - "traefik.tcp.routers.anytype-filenode.tls=true"
+      - "traefik.tcp.routers.anytype-filenode.tls.certresolver=letsencrypt"
+      - "traefik.tcp.services.anytype-filenode.loadbalancer.server.port=${ANY_SYNC_FILENODE_PORT}"
+      - "traefik.udp.routers.anytype-filenode.entrypoints=anytype-udp-1015"
+      - "traefik.udp.services.anytype-filenode.loadbalancer.server.port=${ANY_SYNC_FILENODE_QUIC_PORT}"
+    volumes:
+      - "${CONFIG_DIR}/etc/any-sync-filenode:/etc/any-sync-filenode:Z"
+      - "${CONFIG_DIR}/etc/.aws:/root/.aws:ro"
+      - "${STORAGE_DIR}/networkStore/any-sync-filenode:/networkStore:Z"
+    deploy:
+      resources:
+        limits:
+          memory: ${ANY_SYNC_DAEMONS_MEMORY_LIMIT:-}
+    restart: unless-stopped
+    networks:
+      - anytype
+      - proxy
+
+  any-sync-node-1:
+    image: "ghcr.io/anyproto/any-sync-node:${ANY_SYNC_NODE_VERSION}"
+    depends_on:
+      any-sync-coordinator:
+        condition: service_started
+    labels:
+      - "traefik.enable=true"
+      - "traefik.tcp.routers.anytype-node-1.rule=HostSNI(`${ANY_SYNC_DOMAIN}`)"
+      - "traefik.tcp.routers.anytype-node-1.entrypoints=anytype-tcp-1001"
+      - "traefik.tcp.routers.anytype-node-1.tls=true"
+      - "traefik.tcp.routers.anytype-node-1.tls.certresolver=letsencrypt"
+      - "traefik.tcp.services.anytype-node-1.loadbalancer.server.port=${ANY_SYNC_NODE_1_PORT}"
+      - "traefik.udp.routers.anytype-node-1.entrypoints=anytype-udp-1011"
+      - "traefik.udp.services.anytype-node-1.loadbalancer.server.port=${ANY_SYNC_NODE_1_QUIC_PORT}"
+    volumes:
+      - "${CONFIG_DIR}/etc/any-sync-node-1:/etc/any-sync-node:Z"
+      - "${CONFIG_DIR}/etc/.aws:/root/.aws:ro"
+      - "${STORAGE_DIR}/any-sync-node-1:/storage:Z"
+      - "${STORAGE_DIR}/anyStorage/any-sync-node-1:/anyStorage:Z"
+      - "${STORAGE_DIR}/networkStore/any-sync-node-1:/networkStore:Z"
+    deploy:
+      resources:
+        limits:
+          memory: ${ANY_SYNC_DAEMONS_MEMORY_LIMIT:-}
+    restart: unless-stopped
+    networks:
+      - anytype
+      - proxy
+
+  any-sync-node-2:
+    image: "ghcr.io/anyproto/any-sync-node:${ANY_SYNC_NODE_VERSION}"
+    depends_on:
+      any-sync-coordinator:
+        condition: service_started
+    labels:
+      - "traefik.enable=true"
+      - "traefik.tcp.routers.anytype-node-2.rule=HostSNI(`${ANY_SYNC_DOMAIN}`)"
+      - "traefik.tcp.routers.anytype-node-2.entrypoints=anytype-tcp-1002"
+      - "traefik.tcp.routers.anytype-node-2.tls=true"
+      - "traefik.tcp.routers.anytype-node-2.tls.certresolver=letsencrypt"
+      - "traefik.tcp.services.anytype-node-2.loadbalancer.server.port=${ANY_SYNC_NODE_2_PORT}"
+      - "traefik.udp.routers.anytype-node-2.entrypoints=anytype-udp-1012"
+      - "traefik.udp.services.anytype-node-2.loadbalancer.server.port=${ANY_SYNC_NODE_2_QUIC_PORT}"
+    volumes:
+      - "${CONFIG_DIR}/etc/any-sync-node-2:/etc/any-sync-node:Z"
+      - "${CONFIG_DIR}/etc/.aws:/root/.aws:ro"
+      - "${STORAGE_DIR}/any-sync-node-2:/storage:Z"
+      - "${STORAGE_DIR}/anyStorage/any-sync-node-2:/anyStorage:Z"
+      - "${STORAGE_DIR}/networkStore/any-sync-node-2:/networkStore:Z"
+    deploy:
+      resources:
+        limits:
+          memory: ${ANY_SYNC_DAEMONS_MEMORY_LIMIT:-}
+    restart: unless-stopped
+    networks:
+      - anytype
+      - proxy
+
+  any-sync-node-3:
+    image: "ghcr.io/anyproto/any-sync-node:${ANY_SYNC_NODE_VERSION}"
+    depends_on:
+      any-sync-coordinator:
+        condition: service_started
+    labels:
+      - "traefik.enable=true"
+      - "traefik.tcp.routers.anytype-node-3.rule=HostSNI(`${ANY_SYNC_DOMAIN}`)"
+      - "traefik.tcp.routers.anytype-node-3.entrypoints=anytype-tcp-1003"
+      - "traefik.tcp.routers.anytype-node-3.tls=true"
+      - "traefik.tcp.routers.anytype-node-3.tls.certresolver=letsencrypt"
+      - "traefik.tcp.services.anytype-node-3.loadbalancer.server.port=${ANY_SYNC_NODE_3_PORT}"
+      - "traefik.udp.routers.anytype-node-3.entrypoints=anytype-udp-1013"
+      - "traefik.udp.services.anytype-node-3.loadbalancer.server.port=${ANY_SYNC_NODE_3_QUIC_PORT}"
+    volumes:
+      - "${CONFIG_DIR}/etc/any-sync-node-3:/etc/any-sync-node:Z"
+      - "${CONFIG_DIR}/etc/.aws:/root/.aws:ro"
+      - "${STORAGE_DIR}/any-sync-node-3:/storage:Z"
+      - "${STORAGE_DIR}/anyStorage/any-sync-node-3:/anyStorage:Z"
+      - "${STORAGE_DIR}/networkStore/any-sync-node-3:/networkStore:Z"
+    deploy:
+      resources:
+        limits:
+          memory: ${ANY_SYNC_DAEMONS_MEMORY_LIMIT:-}
+    restart: unless-stopped
+    networks:
+      - anytype
+      - proxy
+
+  any-sync-consensusnode:
+    image: "ghcr.io/anyproto/any-sync-consensusnode:${ANY_SYNC_CONSENSUSNODE_VERSION}"
+    depends_on:
+      any-sync-coordinator:
+        condition: service_started
+    labels:
+      - "traefik.enable=true"
+      - "traefik.tcp.routers.anytype-consensusnode.rule=HostSNI(`${ANY_SYNC_DOMAIN}`)"
+      - "traefik.tcp.routers.anytype-consensusnode.entrypoints=anytype-tcp-1006"
+      - "traefik.tcp.routers.anytype-consensusnode.tls=true"
+      - "traefik.tcp.routers.anytype-consensusnode.tls.certresolver=letsencrypt"
+      - "traefik.tcp.services.anytype-consensusnode.loadbalancer.server.port=${ANY_SYNC_CONSENSUSNODE_PORT}"
+      - "traefik.udp.routers.anytype-consensusnode.entrypoints=anytype-udp-1016"
+      - "traefik.udp.services.anytype-consensusnode.loadbalancer.server.port=${ANY_SYNC_CONSENSUSNODE_QUIC_PORT}"
+    volumes:
+      - "${CONFIG_DIR}/etc/any-sync-consensusnode:/etc/any-sync-consensusnode:Z"
+      - "${STORAGE_DIR}/networkStore/any-sync-consensusnode:/networkStore:Z"
+    deploy:
+      resources:
+        limits:
+          memory: ${ANY_SYNC_DAEMONS_MEMORY_LIMIT:-}
+    restart: unless-stopped
+    networks:
+      - anytype
+      - proxy
+
+  # any-sync-netcheck
+  netcheck:
+    image: "ghcr.io/anyproto/any-sync-tools:${ANY_SYNC_TOOLS_VERSION}"
+    pull_policy: always
+    restart: unless-stopped
+    depends_on:
+      - any-sync-consensusnode
+      - any-sync-filenode
+      - any-sync-coordinator
+      - any-sync-node-1
+      - any-sync-node-2
+      - any-sync-node-3
+    volumes:
+      - "${STORAGE_DIR}/docker-generateconfig:/conf:Z"
+    command: ["tail", "-f", "/dev/null"]
+    stop_signal: SIGKILL
+    tty: true
+    healthcheck:
+      test: any-sync-netcheck -c /conf/nodes.yml 2>&1| grep -E 'netcheck\s+success'
+      interval: 10s
+      start_period: 5s
+    networks:
+      - anytype
+
+  anytype-cli:
+    image: "anyproto/anytype-cli:latest"
+    depends_on:
+      generateconfig-processing:
+        condition: service_completed_successfully
+      any-sync-coordinator:
+        condition: service_healthy
+    environment:
+      ANYTYPE_LOG_LEVEL: "${ANYTYPE_LOG_LEVEL}"
+      ANYTYPE_BOT_NAME: "${ANYTYPE_BOT_NAME}"
+      ANYTYPE_API_KEY_NAME: "${ANYTYPE_API_KEY_NAME}"
+    volumes:
+      - "${CONFIG_DIR}/anytype-cli/.anytype:/root/.anytype:Z"
+      - "${CONFIG_DIR}/anytype-cli/.config/anytype:/root/.config/anytype:Z"
+      - "${STORAGE_DIR}/docker-generateconfig:/data/network-config:ro,Z"
+    expose:
+      - "${ANYTYPE_API_PORT}"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-H", "Authorization: Bearer check", "http://localhost:${ANYTYPE_API_PORT}/api/v1/account.info"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: always
+    entrypoint: []
+    command: >
+      /bin/sh -c "
+      if [ -f /data/network-config/anytype-cli-init.sh ]; then
+        bash /data/network-config/anytype-cli-init.sh /data/network-config/nodesProcessed.yml || true;
+      fi;
+      exec anytype serve --listen-address 0.0.0.0:${ANYTYPE_API_PORT}
+      "
+    networks:
+      - anytype
+      - bridge
+
+networks:
+  anytype:
+  bridge:
+  proxy:
+    name: proxy
+    external: true

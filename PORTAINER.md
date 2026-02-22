@@ -24,7 +24,6 @@ This guide covers deploying the any-sync stack with Traefik proxy integration an
 - **Docker Host**: Running Docker 20.10+ with Docker Compose 2.0+
 - **Traefik**: Already running and accessible on the network (external to this stack)
 - **Disk Space**: At least 50GB for persistent data (depends on usage)
-- **Memory**: Minimum 4GB RAM; 8GB+ recommended for production
 - **Connectivity**: All containers must reach the Traefik reverse proxy
 
 ### DNS and Firewall
@@ -43,120 +42,45 @@ Your external Traefik instance must:
 
 - Support TCP proxying for P2P services
 - Have a routable network connection to the Docker host (but not directly expose it)
-- Use dynamic config with file provider (hot reload, no restart needed)
+- Use the Docker provider for label-based routing
+- Define TCP/UDP entrypoints for ports 1001-1006 and 1011-1016
 - Implement rate limiting for DDoS protection
 
 ---
 
 ## Architecture Overview
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                   Any-Sync Stack                        │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  ┌──────────────────────┐      ┌──────────────────┐   │
-│  │  Configuration Gen   │      │  Infrastructure  │   │
-│  │  (run once)          │      │  Services        │   │
-│  │  - anyconf.sh        │      │  - MongoDB       │   │
-│  │  - processing.sh     │      │  - Redis         │   │
-│  │  - anytype-cli-init  │      │  - MinIO         │   │
-│  └──────────────────────┘      └──────────────────┘   │
-│           │                            │               │
-│           └────────────┬───────────────┘               │
-│                        ▼                               │
-│  ┌───────────────────────────────────────────────────┐ │
-│  │        Any-Sync Network Services                 │ │
-│  ├───────────────────────────────────────────────────┤ │
-│  │  - any-sync-coordinator (service registry)       │ │
-│  │  - any-sync-node-{1,2,3} (data storage)         │ │
-│  │  - any-sync-filenode (file storage)             │ │
-│  │  - any-sync-consensusnode (consensus)           │ │
-│  │  - anytype-cli (API server)                      │ │
-│  │  - netcheck (network diagnostics)                │ │
-│  └───────────────────────────────────────────────────┘ │
-│           │                                             │
-│           └────────────┬────────────────────────────┐  │
-└────────────────────────┼────────────────────────────┘  │
-                         │                                │
-        ┌────────────────┴────────────────┐               │
-        │                                 │               │
-    ┌───▼──────────────┐      ┌──────────▼────────────┐  │
-    │  Internal Network│      │  Traefik Proxy       │  │
-    │  (Docker only)   │      │  (External)          │  │
-    └──────────────────┘      └──────────────────────┘  │
-        │                              │                 │
-        └──────────────────┬───────────┘                 │
-                           │                             │
-                    ┌──────▼────────┐                    │
-                    │ n8n Instance   │                   │
-                    │ (API Client)   │                   │
-                    └────────────────┘                   │
-```
+An anysync instance serves as a sync host
+An anytype-cli instance serves as an automation interface bot
+Access to anytype-cli for n8n via an internal docker network.
 
-### Service Layers
 
-**Internal Services (Docker network only)**:
-
-- MongoDB, Redis, MinIO (infrastructure)
-- All any-sync services (P2P networking)
-- anytype-cli (HTTP API)
-
-**External Access (via Traefik)**:
-
-- Any-sync P2P services (TCP/QUIC routing)
-- Optional metrics and diagnostics endpoints
-
-**Private Integration (n8n)**:
-
-- anytype-cli accessible via internal Docker network
-- HTTP REST API on port 31012
-
----
-
-## Docker Compose Deployment
-
-### Step 1: Deploy via Portainer
+## Docker Compose via Portainer
 
 1. **Open Portainer Dashboard**
-   - Navigate to `https://your-portainer-host:9443`
    - Log in to your Portainer instance
 
 2. **Create a New Stack**
    - Go to **Stacks** > **Add Stack**
    - Choose deployment method:
-     - **Paste compose file**: Copy the contents of `docker-compose.yml`
-     - **Git**: Link to your repository (recommended for updates)
-     - **Upload**: Select the file from your computer
+     - **Paste compose file**: Copy the contents of `docker-compose.anytype-cli-portainer.yml`
 
 3. **Configure Stack Name**
    - Enter a name (e.g., `any-sync-network`)
    - This will be the prefix for all generated resources
 
-### Step 2: Set Environment Variables
+4. **Set Environment Variables**
+   - Click 'load from .env file'
+   - Upload .env.default or default.env
+   - Change these settings:
+     - CONFIG_DIR -> "/data/anytype/config"
+     - STORAGE_DIR -> "/data/anytype/storage"
+     - ANY_SYNC_DOMAIN -> anytype.yourdomain.com
+     - ANY_SYNC_NODE_VERSION=latest
+     - ANY_SYNC_FILENODE_VERSION=latest
+     - ANY_SYNC_COORDINATOR_VERSION=latest
+     - ANY_SYNC_CONSENSUSNODE_VERSION=latest
 
-In the Portainer UI, you can configure variables two ways:
-
-**Option A: Environment Variables in Portainer UI**
-
-1. Under "Environment variables", add each variable:
-   - `STORAGE_DIR` (default: `./storage`)
-   - `EXTERNAL_LISTEN_HOST` (default: `127.0.0.1`)
-   - `TRAEFIK_DOMAIN` (e.g., `any-sync.example.com`)
-   - Any version overrides (e.g., `ANY_SYNC_NODE_VERSION=prod`)
-
-**Option B: Use .env.override File**
-
-1. Create a `.env.override` file in the stack directory with custom values:
-
-   ```env
-   STORAGE_DIR=/data/any-sync-storage
-   EXTERNAL_LISTEN_HOST=192.168.1.100
-   ANYTYPE_BOT_NAME=my-bot
-   ANYTYPE_LOG_LEVEL=DEBUG
-   ```
-
-2. The stack will use both `.env.default` (base) and `.env.override` (overrides)
 
 ### Step 3: Deploy the Stack
 
@@ -213,20 +137,6 @@ All services communicate via the default Docker Compose network:
 
 ### External Connectivity
 
-#### For Local Development
-
-All internal ports are bound to `127.0.0.1`, accessible only from the Docker host:
-
-```bash
-# From the Docker host
-curl http://127.0.0.1:31012/api/v1/account.info
-
-# From another machine (not accessible)
-curl http://192.168.1.100:31012/api/v1/account.info  # ❌ Connection refused
-```
-
-#### For Remote Access
-
 To allow external clients to reach any-sync services, configure Traefik for TCP/QUIC routing (see [External Access via Traefik](#external-access-via-traefik)).
 
 ### Multi-IP Configuration
@@ -239,9 +149,9 @@ To bind services to multiple network interfaces:
    EXTERNAL_LISTEN_HOSTS=192.168.1.100 10.0.0.50
    ```
 
-2. The any-sync services will advertise all IPs to the network
+1. The any-sync services will advertise all IPs to the network
 
-3. Restart the stack:
+2. Restart the stack:
 
    ```bash
    docker-compose up -d
@@ -261,11 +171,13 @@ On first deployment, the anytype-cli service:
 
 2. **Generates an API key**
    - Named from `ANYTYPE_API_KEY_NAME` env var (default: `n8n-integration`)
-   - Stored in Docker volume for persistence
 
-3. **Starts the HTTP API server**
+- Stored under `${CONFIG_DIR}/anytype-cli` for persistence
+
+1. **Starts the HTTP API server**
    - Listens on port from `ANYTYPE_API_PORT` env var (default: 31012)
-   - Internally only (bound to `127.0.0.1`)
+
+- Internally only (Docker network, not published to host)
 
 ### Retrieving the API Key
 
@@ -289,7 +201,7 @@ docker logs <stack-name>_anytype-cli_1 | grep "API Key"
 
 If you need to regenerate the API key:
 
-1. Delete the volume: `docker volume rm <stack-name>_anytype-cli-config`
+1. Delete the config data under `${CONFIG_DIR}/anytype-cli`
 2. Restart the stack: `docker-compose up -d anytype-cli`
 3. Retrieve the new key from logs
 
@@ -328,138 +240,53 @@ If you need to regenerate the API key:
 - MinIO (9000, 9001) ❌
 - anytype-cli (31012 - internal only) ❌
 
-### Traefik Dynamic Configuration (File Provider)
+### Traefik Static Configuration (required)
 
-Use dynamic config with file provider for zero-downtime updates (no Traefik restart needed).
+This stack uses Docker labels for routing, so only the static entrypoints are needed in Traefik.
 
 **1. Configure Traefik Static Config** (`traefik.yml`):
 
 ```yaml
 entryPoints:
-  tcp-p2p:
-    address: ":6000-6100"
+  anytype-tcp-1001:
+    address: ":1001/tcp"
+  anytype-tcp-1002:
+    address: ":1002/tcp"
+  anytype-tcp-1003:
+    address: ":1003/tcp"
+  anytype-tcp-1004:
+    address: ":1004/tcp"
+  anytype-tcp-1005:
+    address: ":1005/tcp"
+  anytype-tcp-1006:
+    address: ":1006/tcp"
 
-providers:
-  file:
-    filename: /etc/traefik/dynamic.yml
-    watch: true          # 🔥 Auto-reload on changes (no restart!)
+  anytype-udp-1011:
+    address: ":1011/udp"
+  anytype-udp-1012:
+    address: ":1012/udp"
+  anytype-udp-1013:
+    address: ":1013/udp"
+  anytype-udp-1014:
+    address: ":1014/udp"
+  anytype-udp-1015:
+    address: ":1015/udp"
+  anytype-udp-1016:
+    address: ":1016/udp"
 
-log:
-  level: INFO
 ```
 
-**2. Create Dynamic Config** (`/etc/traefik/dynamic.yml`):
-
-```yaml
-routers:
-  coordinator:
-    entryPoints: ["tcp-p2p"]
-    rule: "HostSNI(`coordinator.example.com`)"
-    service: coordinator
-    tls:
-      passthrough: true
-
-  node-1:
-    entryPoints: ["tcp-p2p"]
-    rule: "HostSNI(`node-1.example.com`)"
-    service: node-1
-    tls:
-      passthrough: true
-
-  node-2:
-    entryPoints: ["tcp-p2p"]
-    rule: "HostSNI(`node-2.example.com`)"
-    service: node-2
-    tls:
-      passthrough: true
-
-  node-3:
-    entryPoints: ["tcp-p2p"]
-    rule: "HostSNI(`node-3.example.com`)"
-    service: node-3
-    tls:
-      passthrough: true
-
-  filenode:
-    entryPoints: ["tcp-p2p"]
-    rule: "HostSNI(`filenode.example.com`)"
-    service: filenode
-    tls:
-      passthrough: true
-
-  consensusnode:
-    entryPoints: ["tcp-p2p"]
-    rule: "HostSNI(`consensusnode.example.com`)"
-    service: consensusnode
-    tls:
-      passthrough: true
-
-services:
-  coordinator:
-    loadBalancer:
-      servers:
-        - address: "192.168.1.100:1004"  # Docker host IP
-
-  node-1:
-    loadBalancer:
-      servers:
-        - address: "192.168.1.100:1001"
-
-  node-2:
-    loadBalancer:
-      servers:
-        - address: "192.168.1.100:1002"
-
-  node-3:
-    loadBalancer:
-      servers:
-        - address: "192.168.1.100:1003"
-
-  filenode:
-    loadBalancer:
-      servers:
-        - address: "192.168.1.100:1005"
-
-  consensusnode:
-    loadBalancer:
-      servers:
-        - address: "192.168.1.100:1006"
-```
-
-**3. Verify Hot-Reload**:
-
-Edit the config and Traefik reloads automatically:
-
-```bash
-# No restart needed! Just edit the file:
-nano /etc/traefik/dynamic.yml
-
-# Check logs for reload confirmation
-docker logs <traefik> | grep -i "dynamic"
-```
-
-**Benefits**: ✅ No downtime ✅ Instant updates ✅ Version control friendly
+Routing is defined by Docker labels in the compose file (no `dynamic.yml` needed).
 
 ### DNS Configuration
 
 For clients to connect to your any-sync network, configure DNS to point to **Traefik** (not Docker host):
 
-**Wildcard DNS (Recommended)**:
+**Single A Record**:
 
 ```bash
-# In your DNS provider, point to TRAEFIK public IP (not Docker host!)
-*.example.com  A  203.0.113.50    # <- Traefik public IP
-```
-
-**Individual A Records**:
-
-```bash
-coordinator.example.com    A  203.0.113.50    # <- Traefik public IP
-node-1.example.com         A  203.0.113.50
-node-2.example.com         A  203.0.113.50
-node-3.example.com         A  203.0.113.50
-filenode.example.com       A  203.0.113.50
-consensusnode.example.com  A  203.0.113.50
+# Point the domain used in ANY_SYNC_DOMAIN to Traefik's public IP
+anytype.example.com  A  203.0.113.50
 ```
 
 Replace `203.0.113.50` with your actual Traefik proxy's public IP address.
@@ -508,8 +335,9 @@ sudo ufw default allow outgoing
 # Allow SSH only from specific IPs
 sudo ufw allow from 203.0.113.0/24 to any port 22  # Replace with your admin IP
 
-# Allow Traefik P2P proxy (only this!)
-sudo ufw allow 6000:6100/tcp comment "Traefik P2P proxy"
+# Allow Any-Sync P2P ports only
+sudo ufw allow 1001:1006/tcp comment "Any-Sync TCP"
+sudo ufw allow 1011:1016/udp comment "Any-Sync QUIC"
 
 # HTTPS for Traefik dashboard
 sudo ufw allow 443/tcp comment "HTTPS"
@@ -523,26 +351,7 @@ sudo ufw status numbered
 
 ### DDoS Protection & Rate Limiting
 
-Add rate limiting in Traefik's `dynamic.yml`:
-
-```yaml
-middlewares:
-  rate-limit:
-    rateLimit:
-      average: 100      # 100 requests/sec per IP
-      burst: 500        # Allow bursts up to 500
-      period: 1s
-
-routers:
-  coordinator:
-    middlewares:
-      - rate-limit
-    entryPoints: ["tcp-p2p"]
-    rule: "HostSNI(`coordinator.example.com`)"
-    service: coordinator
-    tls:
-      passthrough: true
-```
+For TCP/UDP entrypoints, prefer OS-level firewall rules and rate limiting at the edge. HTTP middlewares in Traefik do not apply to TCP/UDP routers.
 
 ### Credential Management
 
@@ -567,18 +376,9 @@ certificateResolvers:
       storage: /etc/traefik/acme.json
       httpChallenge:
         entryPoint: http
-
-# dynamic.yml
-routers:
-  coordinator:
-    tls:
-      certResolver: letsencrypt      # Auto-renew certificates
-      domains:
-        - main: coordinator.example.com
-    entryPoints: ["tcp-p2p"]
-    rule: "HostSNI(`coordinator.example.com`)"
-    service: coordinator
 ```
+
+TLS routing is configured by Docker labels in the compose file (no `dynamic.yml` needed).
 
 ### Logging & Monitoring
 
@@ -595,7 +395,7 @@ log:
 ### Security Checklist
 
 - [ ] UFW firewall: deny-all by default
-- [ ] Only expose Traefik proxy ports (6000-6100)
+- [ ] Only expose Any-Sync P2P ports (1001-1006/tcp, 1011-1016/udp)
 - [ ] Never expose MongoDB (27001), Redis (6379), MinIO (9000/9001)
 - [ ] Rate limiting enabled
 - [ ] TLS certificates (Let's Encrypt)
@@ -610,228 +410,23 @@ log:
 
 ## n8n Integration
 
-### Network Communication
+Use n8n on the `bridge` network to reach Anytype CLI:
 
-The n8n instance connects to anytype-cli via the internal Docker network:
+- **URL**: `http://anytype-cli:31012/api/v1/<endpoint>`
+- **Auth**: `Authorization: Bearer <api-key>` (from anytype-cli logs)
 
-- **Protocol**: HTTP REST
-- **Host**: `anytype-cli` (or `<stack-name>_anytype-cli_1`)
-- **Port**: `31012` (or custom if changed)
-- **Authentication**: Bearer token (API key from logs)
-
-### n8n Configuration Setup
-
-#### If n8n is on the Same Docker Network
-
-1. In n8n, create a new HTTP request node
-2. Configure:
-   - **Method**: GET/POST (depending on endpoint)
-   - **URL**: `http://anytype-cli:31012/api/v1/<endpoint>`
-   - **Headers**:
-     - `Authorization`: `Bearer <your-api-key>`
-     - `Content-Type`: `application/json`
-
-#### If n8n is External or on a Different Network
-
-1. Verify network connectivity from n8n to Portainer Docker host
-2. Use the Docker host IP:
-   - **URL**: `http://<docker-host-ip>:31012/api/v1/<endpoint>`
-   - Requires port 31012 to be publicly accessible (modify docker-compose.yml)
-
-### Example Workflow: Create Object
-
-```json
-{
-  "name": "Create Object in Anytype",
-  "nodes": [
-    {
-      "parameters": {
-        "url": "http://anytype-cli:31012/api/v1/object.create",
-        "method": "POST",
-        "headers": {
-          "Authorization": "Bearer {{ $env.ANYTYPE_API_KEY }}",
-          "Content-Type": "application/json"
-        },
-        "body": {
-          "spaceId": "{{ $json.spaceId }}",
-          "type": "ot/document",
-          "details": {
-            "name": "{{ $json.name }}"
-          }
-        }
-      },
-      "name": "Create Object"
-    }
-  ]
-}
-```
-
-### Common API Endpoints
-
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/api/v1/account.info` | GET | Get account information |
-| `/api/v1/space.list` | GET | List spaces |
-| `/api/v1/object.create` | POST | Create new object |
-| `/api/v1/object.get` | GET | Retrieve object |
-| `/api/v1/object.update` | POST | Update object |
-| `/api/v1/object.delete` | POST | Delete object |
-
-See [Anytype Developer Portal](https://developers.anytype.io) for complete API documentation.
+If n8n runs elsewhere, attach it to the `bridge` network or explicitly publish `ANYTYPE_API_PORT` on the host.
 
 ---
 
 ## Troubleshooting
 
-### Common Issues
+Quick checks:
 
-#### 1. anytype-cli Container Keeps Restarting
-
-**Symptoms**: Container restarts every 10-30 seconds
-
-**Causes & Solutions**:
-
-- Check logs: `docker logs <stack>_anytype-cli_1`
-- Common causes:
-  - Network config not generated: Ensure `generateconfig-processing` completed successfully
-  - Missing dependencies: Verify coordinator is healthy
-  - Port already in use: Check `netstat -tlnp | grep 31012`
-
-**Fix**:
-
-```bash
-# View detailed logs
-docker logs -f <stack>_anytype-cli_1
-
-# Restart specific service
-docker-compose -p <stack> restart anytype-cli
-
-# Rebuild if needed
-docker-compose -p <stack> up -d --force-recreate anytype-cli
-```
-
-#### 2. MongoDB Fails to Initialize
-
-**Symptoms**: `mongo-1` container exits or stays unhealthy
-
-**Solution**:
-
-```bash
-# Verify MongoDB is running
-docker exec <stack>_mongo-1_1 mongosh --port 27001 --eval "rs.status()"
-
-# Force replica set initialization
-docker exec <stack>_mongo-1_1 mongosh --port 27001 --eval \
-  "rs.initiate({_id:'rs0', members:[{_id:0, host:'mongo-1:27001'}]})"
-```
-
-#### 3. Anytype-CLI API Not Responding
-
-**Symptoms**: Health check fails, n8n cannot connect
-
-**Diagnosis**:
-
-```bash
-# Test API from Docker host
-curl -v http://127.0.0.1:31012/api/v1/account.info \
-  -H "Authorization: Bearer test"
-
-# View anytype-cli logs
-docker logs <stack>_anytype-cli_1
-
-# Verify port binding
-docker port <stack>_anytype-cli_1
-```
-
-**Solutions**:
-
-1. Check API key in authorization header
-2. Verify anytype-cli service has internet access for initial setup
-3. Ensure network config was generated: `ls storage/docker-generateconfig/nodesProcessed.yml`
-
-#### 4. n8n Cannot Connect to anytype-cli
-
-**Symptoms**: HTTP 503 or connection timeout from n8n
-
-**Checks**:
-
-1. Are n8n and any-sync on the same Docker network?
-
-   ```bash
-   docker network ls
-   docker network inspect <network-name> | grep -A 20 Containers
-   ```
-
-2. Verify service name resolution from n8n container:
-
-   ```bash
-   docker exec <n8n-container> nslookup anytype-cli
-   ```
-
-3. Test connectivity:
-
-   ```bash
-   docker exec <n8n-container> curl -v http://anytype-cli:31012/api/v1/account.info
-   ```
-
-**Solution**: Add n8n to the same network as any-sync:
-
-```yaml
-# In n8n docker-compose or Portainer settings
-networks:
-  - any-sync-network
-
-networks:
-  any-sync-network:
-    external: true
-    name: <stack-name>_default
-```
-
-#### 5. Services Cannot Reach Coordinator
-
-**Symptoms**: Nodes/filenode/consensus containers exit with network errors
-
-**Check**:
-
-```bash
-# Verify coordinator is healthy
-docker ps | grep coordinator
-
-# Test connectivity from a node
-docker exec <stack>_any-sync-node-1_1 \
-  nc -zv any-sync-coordinator 1004
-```
-
-**Solutions**:
-
-1. Ensure MongoDB and Redis are healthy first
-2. Check coordinator logs: `docker logs <stack>_any-sync-coordinator_1`
-3. Verify dependencies are correct in docker-compose.yml
-
-### Viewing Logs
-
-**Via Portainer**:
-
-1. Navigate to **Containers**
-2. Select the container
-3. Click **Logs** at the top
-4. Use search/filter for error messages
-
-**Via Docker CLI**:
-
-```bash
-# View recent logs
-docker logs <container-id>
-
-# Follow logs in real-time
-docker logs -f <container-id>
-
-# Last 100 lines
-docker logs --tail 100 <container-id>
-
-# With timestamps
-docker logs --timestamps <container-id>
-```
+- `docker compose ps` for health status
+- `docker logs <stack>_anytype-cli_1` for API key and startup errors
+- `docker exec <n8n-container> curl -v http://anytype-cli:31012/api/v1/account.info` to verify n8n connectivity
+- `docker exec <stack>_mongo-1_1 mongosh --port 27001 --eval "rs.status()"` for Mongo replica set
 
 ---
 
@@ -839,17 +434,7 @@ docker logs --timestamps <container-id>
 
 ### Backup Strategy
 
-All persistent data is stored in Docker volumes. Create regular backups:
-
-```bash
-# List all volumes for the stack
-docker volume ls | grep <stack-name>
-
-# Volumes created:
-# - any-sync-node-1, any-sync-node-2, any-sync-node-3
-# - storage (parent directory for all data)
-# - anytype-cli-config, anytype-cli-home
-```
+All persistent data lives under `STORAGE_DIR` and `CONFIG_DIR`.
 
 ### Full Stack Backup
 
@@ -859,9 +444,10 @@ docker volume ls | grep <stack-name>
 # Stop the stack
 docker-compose -p <stack> down
 
-# Backup storage directory
+# Backup storage and config directories
 tar -czf any-sync-backup-$(date +%Y%m%d).tar.gz \
-  ./storage \
+  "$STORAGE_DIR" \
+  "$CONFIG_DIR" \
   ./.env.override
 
 # Restart
@@ -880,14 +466,7 @@ docker run --rm \
 
 ### Credential Backup
 
-**Critical**: Backup anytype-cli credentials separately:
-
-```bash
-# Backup API key and config
-docker volume inspect <stack>_anytype-cli-config
-# Note the mount point, then:
-sudo tar -czf anytype-cli-backup.tar.gz <mount-point>/root/.anytype/
-```
+**Critical**: Backup Anytype CLI credentials under `${CONFIG_DIR}/anytype-cli`.
 
 ### Restore Procedure
 
@@ -900,11 +479,11 @@ sudo tar -czf anytype-cli-backup.tar.gz <mount-point>/root/.anytype/
 2. **Restore volumes**:
 
    ```bash
-   # Remove current volumes
-   docker volume rm <stack>_storage
 
-   # Restore from backup
+# Restore from backup
+
    tar -xzf any-sync-backup-20240213.tar.gz
+
    ```
 
 3. **Restart**:
@@ -913,7 +492,7 @@ sudo tar -czf anytype-cli-backup.tar.gz <mount-point>/root/.anytype/
    docker-compose -p <stack> up -d
    ```
 
-4. **Verify health**:
+1. **Verify health**:
 
    ```bash
    docker-compose -p <stack> ps
