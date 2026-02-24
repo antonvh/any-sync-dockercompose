@@ -1,8 +1,6 @@
 #!/bin/bash
 
 echo "INFO: $0 start"
-echo "INFO: loading .env file"
-source .env
 
 echo "INFO: create persistent config dir='./storage/docker-generateconfig'"
 install -d ./storage/docker-generateconfig

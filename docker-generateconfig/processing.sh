@@ -1,8 +1,6 @@
 #!/bin/bash
 
 echo "INFO: $0 start"
-echo "INFO: loading .env file"
-source .env
 
 # Set file paths
 DEST_PATH="./etc"
@@ -51,8 +49,8 @@ cp "storage/docker-generateconfig/nodesProcessed.yml" "${DEST_PATH}/any-sync-coo
 echo "INFO: Copy aws credentials config"
 cp "docker-generateconfig/etc/aws-credentials" "${DEST_PATH}/.aws/credentials"
 
-echo "INFO: Replace variables from .env file"
-for PLACEHOLDER in $( perl -ne 'print "$1\n" if /^([A-z0-9_-]+)=/' .env ); do
+echo "INFO: Replace variables from environment"
+for PLACEHOLDER in $(env | grep -E '^(ANY_SYNC|MONGO|REDIS|MINIO|AWS|EXTERNAL)' | cut -d= -f1); do
     perl -i -pe "s|%${PLACEHOLDER}%|${!PLACEHOLDER}|g" \
         "${DEST_PATH}/"/.aws/credentials \
         "${NETWORK_FILE}" \

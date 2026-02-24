@@ -5,13 +5,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile-generateconfig-anyconf
-    environment:
-      - ANY_SYNC_NODE_1_ADDRESSES=${ANY_SYNC_NODE_1_ADDRESSES}
-      - ANY_SYNC_NODE_2_ADDRESSES=${ANY_SYNC_NODE_2_ADDRESSES}
-      - ANY_SYNC_NODE_3_ADDRESSES=${ANY_SYNC_NODE_3_ADDRESSES}
-      - ANY_SYNC_COORDINATOR_ADDRESSES=${ANY_SYNC_COORDINATOR_ADDRESSES}
-      - ANY_SYNC_FILENODE_ADDRESSES=${ANY_SYNC_FILENODE_ADDRESSES}
-      - ANY_SYNC_CONSENSUSNODE_ADDRESSES=${ANY_SYNC_CONSENSUSNODE_ADDRESSES}
+    env_file:
+      - .env.default
+      - .env.override.latest
     volumes:
       - "${CONFIG_DIR}:/code:Z"
       - "${STORAGE_DIR}:/code/storage:Z"
@@ -27,9 +23,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile-generateconfig-processing
-    environment:
-      - EXTERNAL_LISTEN_HOST=${EXTERNAL_LISTEN_HOST}
-      - EXTERNAL_LISTEN_HOSTS=${EXTERNAL_LISTEN_HOSTS:-}
+    env_file:
+      - .env.default
+      - .env.override.latest
     volumes:
       - "${CONFIG_DIR}:/code:Z"
       - "${STORAGE_DIR}:/code/storage:Z"
